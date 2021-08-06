@@ -105,6 +105,87 @@ struct PromoteMatmulSubviewsPattern
 }  // namespace
 
 namespace {
+/// A pattern to convert statically linalg.mmt4d into vector contract.
+struct VectorizeMMT4DOp : public OpRewritePattern<linalg::Mmt4DOp> {
+  using OpRewritePattern<linalg::Mmt4DOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(linalg::Mmt4DOp mmt4DOp,
+                                PatternRewriter &rewriter) const override {
+    auto lhs = mmt4DOp.inputs()[0];
+    auto rhs = mmt4DOp.inputs()[1];
+    auto dst = mmt4DOp.outputs()[0];
+
+    auto lhsType = lhs.getType().dyn_cast<ShapedType>();
+    auto rhsType = lhs.getType().dyn_cast<ShapedType>();
+
+    if (!lhsType || !rhsType || !lhsType.hasStaticShape() ||
+        !rhsType.hasStaticShape())
+      return failure();
+
+    int M0 = lhsType.getShape()[2];
+    int N0 = rhsType.getShape()[3];
+    int K0 = lhsType.getShape()[3];
+
+    auto loc = mmt4DOp.getLoc();
+    auto c0 = rewriter.create<ConstantIndexOp>(loc, 0);
+
+    auto vecType = VectorType::get({1, 1, M0, N0}, rewriter.getF32Type());
+
+    auto lhsVecType2D = VectorType::get({M0, K0}, rewriter.getF32Type());
+    auto rhsVecType2D = VectorType::get({K0, N0}, rewriter.getF32Type());
+    auto dstVecType2D = VectorType::get({M0, N0}, rewriter.getF32Type());
+
+    auto identityMap = rewriter.getMultiDimIdentityMap(4);
+    auto zeroOffset = ValueRange{c0, c0, c0, c0};
+
+    auto lhsVec = rewriter.create<vector::TransferReadOp>(
+        loc, vecType, lhs, zeroOffset, identityMap);
+
+    auto rhsVec = rewriter.create<vector::TransferReadOp>(
+        loc, vecType, rhs, zeroOffset, identityMap);
+
+    auto dstVec = rewriter.create<vector::TransferReadOp>(
+        loc, vecType, dst, zeroOffset, identityMap);
+
+    Value lhsVec2D =
+        rewriter.create<vector::ShapeCastOp>(loc, lhsVecType2D, lhsVec);
+
+    Value rhsVec2D =
+        rewriter.create<vector::ShapeCastOp>(loc, rhsVecType2D, rhsVec);
+
+    Value dstVec2D =
+        rewriter.create<vector::ShapeCastOp>(loc, dstVecType2D, dstVec);
+
+    auto m = rewriter.getAffineDimExpr(0);
+    auto n = rewriter.getAffineDimExpr(1);
+    auto k = rewriter.getAffineDimExpr(2);
+
+    auto map0 = AffineMap::get(3, 0, {m, k}, rewriter.getContext());
+    auto map1 = AffineMap::get(3, 0, {k, n}, rewriter.getContext());
+    auto map2 = AffineMap::get(3, 0, {m, n}, rewriter.getContext());
+
+    ArrayAttr indexingMaps = rewriter.getAffineMapArrayAttr({map0, map1, map2});
+
+    ArrayAttr iterators = rewriter.getStrArrayAttr(
+        {getParallelIteratorTypeName(), getParallelIteratorTypeName(),
+         getReductionIteratorTypeName()});
+
+    Value contractResult = rewriter.create<vector::ContractionOp>(
+        loc, lhsVec2D, rhsVec2D, dstVec2D, indexingMaps, iterators);
+
+    Value contractResult4D =
+        rewriter.create<vector::ShapeCastOp>(loc, vecType, contractResult);
+
+    rewriter.replaceOpWithNewOp<vector::TransferWriteOp>(
+        mmt4DOp, contractResult4D, dst, zeroOffset, identityMap);
+
+    return success();
+    ;
+  }
+};
+}  // namespace
+
+namespace {
 
 // TODO(ataei): Refactor this into a common utility with LinalgToSPIRV.
 Optional<Value> allocateWorkgroupMemoryOnStack(
@@ -215,6 +296,13 @@ void LLVMCPUVectorizationPass::runOnOperation() {
 
   if (!lowerToVectors) {
     return;
+  }
+
+  // Op specific conversion.
+  {
+    RewritePatternSet vectorizeOpsPattenrs(context);
+    vectorizeOpsPattenrs.insert<VectorizeMMT4DOp>(context);
+    (void)applyPatternsAndFoldGreedily(funcOp, std::move(vectorizeOpsPattenrs));
   }
 
   // Apply vectorization patterns.
